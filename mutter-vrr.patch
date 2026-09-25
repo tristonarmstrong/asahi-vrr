@@ -1,0 +1,206 @@
+--- pristine/mutter-50.5/clutter/clutter/clutter-frame-clock.c	2026-09-15 08:51:27.000000000 -0500
++++ mutter-50.5/clutter/clutter/clutter-frame-clock.c	2026-09-24 22:33:50.466584733 -0500
+@@ -106,6 +106,7 @@
+   gboolean destroy_emitted;
+ 
+   float refresh_rate;
++  float min_refresh_rate;
+   int64_t refresh_interval_us;
+   int64_t maximum_refresh_interval_us;
+ 
+@@ -245,6 +246,27 @@
+     (int64_t) (0.5 + G_USEC_PER_SEC / refresh_rate);
+ }
+ 
++/*
++ * Set the lowest refresh rate the output can present at. In VRR mode the
++ * frame clock throttles idle updates to this interval instead of the
++ * hardcoded MINIMUM_REFRESH_RATE. Pass 0 to fall back to the default.
++ */
++void
++clutter_frame_clock_set_min_refresh_rate (ClutterFrameClock *frame_clock,
++                                          float              refresh_rate)
++{
++  if (refresh_rate <= 0.0f)
++    refresh_rate = MINIMUM_REFRESH_RATE;
++
++  frame_clock->min_refresh_rate = refresh_rate;
++  frame_clock->maximum_refresh_interval_us =
++    (int64_t) (0.5 + G_USEC_PER_SEC / refresh_rate);
++
++  if (frame_clock->mode == CLUTTER_FRAME_CLOCK_MODE_VARIABLE &&
++      frame_clock->pending_reschedule)
++    clutter_frame_clock_schedule_flush_update (frame_clock);
++}
++
+ static Frame *
+ clutter_frame_clock_new_frame (ClutterFrameClock *frame_clock)
+ {
+@@ -1967,6 +1989,8 @@
+   frame_clock->maximum_refresh_interval_us =
+     (int64_t) (0.5 + G_USEC_PER_SEC / MINIMUM_REFRESH_RATE);
+ 
++  frame_clock->min_refresh_rate = MINIMUM_REFRESH_RATE;
++
+   frame_clock->vblank_duration_us = vblank_duration_us;
+ 
+   frame_clock->output_name = g_strdup (output_name);
+--- pristine/mutter-50.5/clutter/clutter/clutter-frame-clock.h	2026-09-15 08:51:27.000000000 -0500
++++ mutter-50.5/clutter/clutter/clutter-frame-clock.h	2026-09-24 22:33:54.299011008 -0500
+@@ -128,6 +128,10 @@
+ CLUTTER_EXPORT
+ float clutter_frame_clock_get_refresh_rate (ClutterFrameClock *frame_clock);
+ 
++CLUTTER_EXPORT
++void clutter_frame_clock_set_min_refresh_rate (ClutterFrameClock *frame_clock,
++                                               float              refresh_rate);
++
+ void clutter_frame_clock_record_flip_time (ClutterFrameClock *frame_clock,
+                                            int64_t            flip_time_us);
+ 
+--- pristine/mutter-50.5/clutter/clutter/clutter-stage-view.c	2026-09-15 08:51:27.000000000 -0500
++++ mutter-50.5/clutter/clutter/clutter-stage-view.c	2026-09-24 22:34:45.229036584 -0500
+@@ -45,6 +45,7 @@
+   PROP_OUTPUT_COLOR_STATE,
+   PROP_SCALE,
+   PROP_REFRESH_RATE,
++  PROP_MIN_REFRESH_RATE,
+   PROP_VBLANK_DURATION_US,
+   PROP_TRANSFORM,
+ 
+@@ -91,6 +92,7 @@
+   MtkRegion *accumulated_redraw_clip;
+ 
+   float refresh_rate;
++  float min_refresh_rate;
+   int64_t vblank_duration_us;
+   ClutterFrameClock *frame_clock;
+ 
+@@ -919,6 +921,20 @@
+   return priv->refresh_rate;
+ }
+ 
++void
++clutter_stage_view_set_min_refresh_rate (ClutterStageView *view,
++                                         float             refresh_rate)
++{
++  ClutterStageViewPrivate *priv =
++    clutter_stage_view_get_instance_private (view);
++
++  if (priv->min_refresh_rate == refresh_rate)
++    return;
++
++  priv->min_refresh_rate = refresh_rate;
++  clutter_frame_clock_set_min_refresh_rate (priv->frame_clock, refresh_rate);
++}
++
+ /**
+  * clutter_stage_view_get_frame_clock: (skip)
+  */
+@@ -1217,6 +1233,9 @@
+     case PROP_REFRESH_RATE:
+       g_value_set_float (value, priv->refresh_rate);
+       break;
++    case PROP_MIN_REFRESH_RATE:
++      g_value_set_float (value, priv->min_refresh_rate);
++      break;
+     case PROP_VBLANK_DURATION_US:
+       g_value_set_int64 (value, priv->vblank_duration_us);
+       break;
+@@ -1274,6 +1293,9 @@
+     case PROP_REFRESH_RATE:
+       priv->refresh_rate = g_value_get_float (value);
+       break;
++    case PROP_MIN_REFRESH_RATE:
++      priv->min_refresh_rate = g_value_get_float (value);
++      break;
+     case PROP_VBLANK_DURATION_US:
+       priv->vblank_duration_us = g_value_get_int64 (value);
+       break;
+@@ -1301,6 +1323,9 @@
+                                                &frame_clock_listener_iface,
+                                                view);
+ 
++  clutter_frame_clock_set_min_refresh_rate (priv->frame_clock,
++                                            priv->min_refresh_rate);
++
+   clutter_stage_view_ensure_color_states (view);
+ 
+   clutter_stage_view_add_redraw_clip (view, NULL);
+@@ -1433,6 +1458,13 @@
+                         G_PARAM_READWRITE |
+                         G_PARAM_CONSTRUCT |
+                         G_PARAM_STATIC_STRINGS);
++
++  obj_props[PROP_MIN_REFRESH_RATE] =
++    g_param_spec_float ("min-refresh-rate", NULL, NULL,
++                        0.0, G_MAXFLOAT, 0.0,
++                        G_PARAM_READWRITE |
++                        G_PARAM_CONSTRUCT |
++                        G_PARAM_STATIC_STRINGS);
+ 
+   obj_props[PROP_VBLANK_DURATION_US] =
+     g_param_spec_int64 ("vblank-duration-us", NULL, NULL,
+--- pristine/mutter-50.5/clutter/clutter/clutter-stage-view.h	2026-09-15 08:51:27.000000000 -0500
++++ mutter-50.5/clutter/clutter/clutter-stage-view.h	2026-09-24 22:34:48.123059469 -0500
+@@ -75,6 +75,10 @@
+ float clutter_stage_view_get_refresh_rate (ClutterStageView *view);
+ 
+ CLUTTER_EXPORT
++void clutter_stage_view_set_min_refresh_rate (ClutterStageView *view,
++                                              float             refresh_rate);
++
++CLUTTER_EXPORT
+ gboolean clutter_stage_view_has_shadowfb (ClutterStageView *view);
+ 
+ CLUTTER_EXPORT
+--- pristine/mutter-50.5/src/backends/native/meta-renderer-native.c	2026-09-15 08:51:27.000000000 -0500
++++ mutter-50.5/src/backends/native/meta-renderer-native.c	2026-09-24 22:34:53.497121994 -0500
+@@ -1614,20 +1614,33 @@
+                                     MTK_ROUNDING_STRATEGY_ROUND,
+                                     &view_layout);
+ 
+-  view_native = g_object_new (META_TYPE_RENDERER_VIEW_NATIVE,
+-                              "name", meta_output_get_name (output),
+-                              "backend", backend,
+-                              "color-device", color_device,
+-                              "stage", meta_backend_get_stage (backend),
+-                              "layout", &view_layout,
+-                              "crtc", crtc,
+-                              "scale", scale,
+-                              "framebuffer", framebuffer,
+-                              "use-shadowfb", use_shadowfb,
+-                              "transform", view_transform,
+-                              "refresh-rate", crtc_mode_info->refresh_rate,
+-                              "vblank-duration-us", crtc_mode_info->vblank_duration_us,
+-                              NULL);
++  {
++    const MetaOutputInfo *output_info = meta_output_get_info (output);
++    int min_refresh_rate = 0;
++    float min_refresh_rate_float;
++
++    if (meta_output_info_get_min_refresh_rate (output_info, &min_refresh_rate) &&
++        min_refresh_rate > 0 && min_refresh_rate < crtc_mode_info->refresh_rate)
++      min_refresh_rate_float = (float) min_refresh_rate;
++    else
++      min_refresh_rate_float = 0.0f;
++
++    view_native = g_object_new (META_TYPE_RENDERER_VIEW_NATIVE,
++                                "name", meta_output_get_name (output),
++                                "backend", backend,
++                                "color-device", color_device,
++                                "stage", meta_backend_get_stage (backend),
++                                "layout", &view_layout,
++                                "crtc", crtc,
++                                "scale", scale,
++                                "framebuffer", framebuffer,
++                                "use-shadowfb", use_shadowfb,
++                                "transform", view_transform,
++                                "refresh-rate", crtc_mode_info->refresh_rate,
++                                "min-refresh-rate", min_refresh_rate_float,
++                                "vblank-duration-us", crtc_mode_info->vblank_duration_us,
++                                NULL);
++  }
+ 
+   if (META_IS_ONSCREEN_NATIVE (framebuffer))
+     {

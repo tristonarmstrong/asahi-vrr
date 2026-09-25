@@ -130,7 +130,7 @@ index bd2087684..af90c5cab 100644
  	      struct apple_connector *connector);
  int dcp_start(struct platform_device *pdev);
 diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
-index 1d90e4a25..df8b1d67a 100644
+index 1d90e4a25..a7f388b20 100644
 --- a/drivers/gpu/drm/apple/iomfb.c
 +++ b/drivers/gpu/drm/apple/iomfb.c
 @@ -246,6 +246,17 @@ void dcp_hotplug(struct work_struct *work)
@@ -151,6 +151,183 @@ index 1d90e4a25..df8b1d67a 100644
  	}
  
  	/*
+@@ -344,6 +355,153 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
+ 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
+ }
+ 
++/*
++ * The internal panel has no EDID, so userspace (e.g. mutter) cannot learn
++ * its adaptive-sync refresh range. Without that, mutter falls back to a
++ * hardcoded 30 Hz minimum and never idles down to the panel's real 24 Hz
++ * minimum.
++ *
++ * Build a valid EDID 1.4 base block containing:
++ *  - descriptor 1: a detailed timing descriptor for the preferred mode,
++ *    which the base EDID requires to appear first;
++ *  - descriptor 2: a Display Range Limits descriptor advertising the
++ *    parsed VRR range, so userspace can discover the minimum refresh rate;
++ *  - descriptors 3-4: dummy descriptors.
++ */
++static const struct drm_edid *dcp_synth_panel_edid(struct apple_dcp *dcp)
++{
++	const struct drm_display_mode *pref = NULL;
++	u8 edid[EDID_LENGTH] = { 0 };
++	u16 min_hz = 0, max_hz = 0;
++	u16 hactive, vactive, hblank, vblank;
++	u16 hfront, hsync, vfront, vsync;
++	u16 hsize_mm = 0, vsize_mm = 0;
++	u32 pixel_clock_khz;
++	u8 *dtd, *rng;
++	int i;
++
++	for (i = 0; i < dcp->nr_modes; i++) {
++		if (!dcp->modes[i].vrr)
++			continue;
++		min_hz = dcp->modes[i].min_vrr >> 16;
++		max_hz = dcp->modes[i].max_vrr >> 16;
++		pref = &dcp->modes[i].mode;
++		break;
++	}
++
++	if (!min_hz || !max_hz || !pref)
++		return NULL;
++
++	hactive = pref->hdisplay;
++	vactive = pref->vdisplay;
++	hblank = pref->htotal - pref->hdisplay;
++	vblank = pref->vtotal - pref->vdisplay;
++	hfront = pref->hsync_start - pref->hdisplay;
++	hsync = pref->hsync_end - pref->hsync_start;
++	vfront = pref->vsync_start - pref->vdisplay;
++	vsync = pref->vsync_end - pref->vsync_start;
++	pixel_clock_khz = pref->clock; /* kHz */
++	if (dcp->width_mm > 0 && dcp->height_mm > 0) {
++		hsize_mm = dcp->width_mm;
++		vsize_mm = dcp->height_mm;
++	}
++
++	/* Header */
++	edid[0] = 0x00; edid[1] = 0xff; edid[2] = 0xff; edid[3] = 0xff;
++	edid[4] = 0xff; edid[5] = 0xff; edid[6] = 0xff; edid[7] = 0x00;
++	/* Manufacturer "APP", product 0x0000 */
++	edid[8] = 0x06; edid[9] = 0x10;
++	edid[10] = 0x00; edid[11] = 0x00;
++	edid[12] = 0x01; edid[13] = 0x00; edid[14] = 0x00; edid[15] = 0x00;
++	edid[16] = 0x01; edid[17] = 0x1c;
++	edid[18] = 0x01; edid[19] = 0x04;      /* EDID 1.4 */
++	edid[20] = 0xa5;                       /* digital, 8bpc, DisplayPort */
++	/* sRGB chromaticity (D65 white point, standard primaries) */
++	edid[23] = 0xee;
++	edid[24] = 0x95; edid[25] = 0xa3;      /* red 0.640,0.330 */
++	edid[26] = 0x55; edid[27] = 0x4f;      /* green 0.300,0.600 */
++	edid[28] = 0x9f; edid[29] = 0x26;      /* blue 0.150,0.060 */
++	edid[30] = 0x0b; edid[31] = 0x50;      /* white 0.3127,0.3290 */
++	edid[32] = 0x00; edid[33] = 0x00;
++	/* Established timings: none */
++	edid[35] = 0x00; edid[36] = 0x00; edid[37] = 0x00;
++	/* Standard timings: unused */
++	for (i = 38; i < 54; i += 2) {
++		edid[i] = 0x01;
++		edid[i + 1] = 0x01;
++	}
++
++	/* Descriptor 1: Detailed Timing Descriptor (preferred mode) */
++	dtd = &edid[54];
++	dtd[0] = (u8)((pixel_clock_khz / 10) & 0xff);
++	dtd[1] = (u8)(((pixel_clock_khz / 10) >> 8) & 0xff);
++	dtd[2] = hactive & 0xff;
++	dtd[3] = hblank & 0xff;
++	dtd[4] = ((hactive >> 8) & 0x0f) << 4 | ((hblank >> 8) & 0x0f);
++	dtd[5] = vactive & 0xff;
++	dtd[6] = vblank & 0xff;
++	dtd[7] = ((vactive >> 8) & 0x0f) << 4 | ((vblank >> 8) & 0x0f);
++	dtd[8] = hfront & 0xff;
++	dtd[9] = hsync & 0xff;
++	dtd[10] = ((vfront & 0x0f) << 4) | (vsync & 0x0f);
++	dtd[11] = ((hfront >> 4) & 0x03) << 6 |
++		  ((hsync >> 4) & 0x03) << 4 |
++		  ((vfront >> 4) & 0x03) << 2 |
++		  ((vsync >> 4) & 0x03);
++	dtd[12] = hsize_mm & 0xff;
++	dtd[13] = vsize_mm & 0xff;
++	dtd[14] = 0x00;      /* h border */
++	dtd[15] = 0x00;      /* v border */
++	dtd[16] = 0x1e;      /* digital separate, hsync/vsync positive */
++	dtd[17] = 0x00;
++
++	/* Descriptor 2: Display Range Limits (tag 0xfd) */
++	rng = &edid[72];
++	rng[0] = 0x00; rng[1] = 0x00;
++	rng[2] = 0x00; rng[3] = 0xfd; rng[4] = 0x00;
++	rng[5] = (u8)min_hz;                 /* min vertical rate (Hz) */
++	rng[6] = (u8)max_hz;                 /* max vertical rate (Hz) */
++	rng[7] = 30;                         /* min horizontal rate (kHz) */
++	rng[8] = 200;                        /* max horizontal rate (kHz) */
++	{
++		u32 dotclk = pixel_clock_khz / 10000; /* max dotclock, 10 MHz units */
++
++		if (dotclk == 0)
++			dotclk = 1;
++		else if (dotclk > 255)
++			dotclk = 255;
++		rng[9] = (u8)dotclk;
++	}
++	rng[10] = 0x00;                      /* default GTF */
++	rng[11] = 0x0a;
++	rng[12] = 0x20; rng[13] = 0x20;
++	rng[14] = 0x20; rng[15] = 0x20;
++	rng[16] = 0x20; rng[17] = 0x20;
++
++	/* Descriptors 3-4: dummy 0x10 tag */
++	for (i = 0; i < 2; i++) {
++		int o = 90 + i * 18;
++
++		edid[o] = 0x00; edid[o + 1] = 0x00;
++		edid[o + 2] = 0x00; edid[o + 3] = 0x10;
++		edid[o + 4] = 0x00;
++	}
++
++	/* Extension count */
++	edid[126] = 0x00;
++
++	/* Compute EDID checksum */
++	{
++		u8 sum = 0;
++
++		for (i = 0; i < EDID_LENGTH - 1; i++)
++			sum += edid[i];
++		edid[EDID_LENGTH - 1] = (u8)(0x100 - sum);
++	}
++
++	return drm_edid_alloc(edid, EDID_LENGTH);
++}
++
+ int dcp_get_modes(struct drm_connector *connector)
+ {
+ 	struct apple_connector *apple_connector = to_apple_connector(connector);
+@@ -376,6 +534,22 @@ int dcp_get_modes(struct drm_connector *connector)
+ 			apple_connector->drm_edid = edid;
+ 		}
+ 	}
++
++	/*
++	 * Internal panel: no EDID is available and dcpavserv is not used.
++	 * Provide a synthetic one advertising the VRR range so userspace can
++	 * discover the minimum refresh rate.
++	 */
++	if (dcp->nr_modes && dcp_has_panel(dcp) && !apple_connector->drm_edid) {
++		const struct drm_edid *edid = dcp_synth_panel_edid(dcp);
++
++		if (edid) {
++			apple_connector->drm_edid = edid;
++			dev_info(dcp->dev,
++				 "using synthetic panel EDID with VRR range\n");
++		}
++	}
++
+ 	if (dcp->nr_modes && apple_connector->drm_edid)
+ 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+ 
 diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
 index 0e5d5908a..36a485461 100644
 --- a/drivers/gpu/drm/apple/iomfb_template.c

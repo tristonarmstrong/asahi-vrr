@@ -7,19 +7,21 @@ This is a personal record, not an upstream submission.
 
 ## What is here
 
-- [`PROGRESS.md`](PROGRESS.md) — full write-up: the three driver fixes, the
-  measurements, and the mutter limitation that remains.
-- [`asahi-vrr.patch`](asahi-vrr.patch) — the drm/apple driver changes as a
-  patch against `chadmed/linux` branch `dcp/vrr` base `8a808006a`, including
-  temporary debug instrumentation.
+- [`PROGRESS.md`](PROGRESS.md) — the full write-up: the three driver fixes, the
+  synthetic EDID, the mutter experiment, and the measurements.
+- [`asahi-vrr.patch`](asahi-vrr.patch) — the drm/apple driver changes against
+  `chadmed/linux` branch `dcp/vrr` base `8a808006a`, including temporary debug
+  instrumentation.
+- [`mutter-vrr.patch`](mutter-vrr.patch) — the mutter 50.5 changes that wire the
+  panel's minimum refresh rate into the frame-clock idle target.
 
 ## Headline
 
-The driver now advertises variable refresh to the compositor, applies it
-without breaking page flips, and supplies a synthetic EDID so userspace can read
-the panel's refresh range. The panel already throttles itself to roughly
-24–30 Hz at idle. The remaining gap is a hardcoded 30 Hz floor in mutter's
-frame clock, which needs a mutter change.
+The driver advertises variable refresh to the compositor, applies it without
+breaking page flips, and supplies a conformant synthetic EDID advertising the
+panel's 24–120 Hz range. A patched mutter reads that range and idles at 24 Hz
+for fullscreen content. The plain desktop does not use mutter's VRR path, so the
+patch does not change it.
 
 ## Hardware and software
 
@@ -29,10 +31,16 @@ frame clock, which needs a mutter change.
 - DCP firmware compatibility version 13.5.
 - GNOME 50.5 / mutter 50.5 on Fedora Asahi Remix 44.
 
-## Applying the patch
+## Applying the patches
 
 From a clean checkout of `chadmed/linux` at `dcp/vrr`:
 
 ```
 git apply asahi-vrr.patch
+```
+
+From a mutter 50.5 source tree:
+
+```
+patch -p1 < mutter-vrr.patch
 ```
