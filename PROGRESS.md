@@ -201,13 +201,13 @@ presents when content changes and holds the frame otherwise.
 Kernel changes are committed on branch `dcp/vrr`:
 
 - `de54e7411` "drm: apple: apply VRR live in flush path instead of forced
-  modeset" — fixes 1 and 2, plus temporary debug instrumentation.
+  modeset" — fixes 1 and 2.
 - `c0d90ea98` "drm: apple: synthesize a valid EDID for the internal panel" —
   fix 3.
+- `e600f5ed2` "drm: apple: remove VRR bring-up debug scaffolding" — drops the
+  temporary module parameters and verbose logging added during bring-up. The
+  minimum-frequency value is now a named constant, not a tunable.
 - Safety mirror branch `vrr-mutter-work-20260924`.
-
-The debug instrumentation (`apple_ts_mode`, `apple_ts_log`, present-flip and
-swap logging) is temporary and should be removed before any upstream use.
 
 Mutter patch and build live at `/home/tristonarmstrong/mutter-vrr/`:
 `mutter-vrr.patch`, the patched source tree, and `deploy.sh`. The distro
@@ -227,11 +227,9 @@ sudo dracut --kver 7.0.11+ --force
 sudo reboot
 ```
 
-Enable the trace after boot with:
-
-```
-echo 1 | sudo tee /sys/module/appledrm/parameters/apple_ts_log
-```
+The debug module parameters used while bringing this up (`apple_ts_mode`,
+`apple_ts_log`, `apple_vrr_media_rate`, `apple_min_freq`) are no longer part of
+the tree; the patch here is the cleaned-up version.
 
 ## Findings
 
@@ -254,6 +252,4 @@ echo 1 | sudo tee /sys/module/appledrm/parameters/apple_ts_log
 
 If lower desktop idle power is the goal, the lever is FIXED-mode idle handling,
 not the VRR floor. If a stutter-free fullscreen experience is the goal, the
-current driver plus the mutter patch already get there, and the remaining work is
-removing the temporary instrumentation and deciding whether to keep the mutter
-patch private.
+current driver plus the mutter patch already get there.
