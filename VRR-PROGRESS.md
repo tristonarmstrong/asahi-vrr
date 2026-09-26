@@ -9,7 +9,7 @@ mutter only uses the variable-refresh frame-clock path when a fullscreen window
 is present.
 
 Test hardware: MacBookPro18,3 (14-inch M1 Pro, device tree `j314`), internal eDP
-panel at 3024×1964 @ 120 Hz. Kernel tree: a clone of `AsahiLinux/linux`, branch
+panel at 3024×1964 @ 120 Hz. Kernel tree: a clone of `chadmed/linux`, branch
 `dcp/vrr`, base `8a808006a` (7.0.11), plus local work. DCP firmware compatibility
 version 13.5. mutter and GNOME 50.5 on Fedora Asahi Remix 44.
 
@@ -209,15 +209,15 @@ Kernel changes are committed on branch `dcp/vrr`:
   minimum-frequency value is now a named constant, not a tunable.
 - Safety mirror branch `vrr-mutter-work-20260924`.
 
-Mutter patch and build live at `/home/tristonarmstrong/mutter-vrr/`:
-`mutter-vrr.patch`, the patched source tree, and `deploy.sh`. The distro
-libraries are backed up under `/home/tristonarmstrong/mutter-backup/`, and
-`revert-vrr-mutter.sh` restores them.
+Mutter patch and build live at `~/mutter-vrr/`: `mutter-vrr.patch`, the patched
+source tree, and `deploy.sh`. The distro libraries are backed up under
+`~/mutter-backup/`, and `revert-vrr-mutter.sh` restores them. (These two
+directories are workstation-specific scratch space, not part of this repo.)
 
-Driver build loop:
+Driver build loop (paths are the author's; substitute your own tree):
 
 ```
-cd /home/tristonarmstrong/kernel-vrr/linux
+cd ~/kernel-vrr/linux
 source ~/.bashrc
 make -j8 modules
 sudo install -m 644 drivers/gpu/drm/apple/appledrm.ko \
@@ -226,6 +226,9 @@ sudo depmod -a -b / 7.0.11+
 sudo dracut --kver 7.0.11+ --force
 sudo reboot
 ```
+
+The base hides VRR behind a module parameter, so enable it at boot before
+expecting any effect: `appledrm.force_vrr=1` (see `README.md`).
 
 The debug module parameters used while bringing this up (`apple_ts_mode`,
 `apple_ts_log`, `apple_vrr_media_rate`, `apple_min_freq`) are no longer part of

@@ -18,7 +18,7 @@ caveats. This is a personal investigation, not an upstream submission.
 ## Layout
 
 ```
-kernel/            git-format-patch series against AsahiLinux/linux dcp/vrr
+kernel/            git-format-patch series against chadmed/linux dcp/vrr
 mutter/            mutter 50.5 patch + deploy script
 gnome-extension/   GNOME Shell 45-50 extension (vrr-refreshrate@local)
 VRR-PROGRESS.md    lab notes: what was tried, what worked, what did not
@@ -26,9 +26,10 @@ VRR-PROGRESS.md    lab notes: what was tried, what worked, what did not
 
 ## Kernel
 
-Base: a clone of `AsahiLinux/linux` branch `dcp/vrr` at `8a808006a`
-("NOUPSTREAM: drm: apple: Hide VRR behind a module parameter"), which already
-contains chadmed's Adaptive Sync bring-up.
+Base: a clone of `chadmed/linux` (the fork behind
+[AsahiLinux/linux#477](https://github.com/AsahiLinux/linux/pull/477)) branch
+`dcp/vrr` at `8a808006a` ("NOUPSTREAM: drm: apple: Hide VRR behind a module
+parameter"), which already contains chadmed's Adaptive Sync bring-up.
 
 The three commits in `kernel/000*.patch` are the local work on top of that base:
 
@@ -40,18 +41,34 @@ The three commits in `kernel/000*.patch` are the local work on top of that base:
 
 `kernel/macsmc-power-bcf0-width.patch` is unrelated to VRR: it handles the
 `BCF0` SMC key being 1 byte on newer firmware (macOS 15.4+, iBoot "27") and 4
-bytes on older firmware.
+bytes on older firmware. It is a plain diff, not a `git am` mailbox:
+
+```sh
+git apply /path/to/asahi-vrr/kernel/macsmc-power-bcf0-width.patch
+```
 
 Apply on top of a `dcp/vrr` checkout:
 
 ```sh
-cd /path/to/linux          # branch dcp/vrr at 8a808006a
+cd /path/to/linux          # chadmed/linux branch dcp/vrr at 8a808006a
 git am /path/to/asahi-vrr/kernel/000*.patch
 ```
+
+The base hides VRR behind a module parameter, so the patched driver stays in
+its default (VRR off) state unless you opt in at boot:
+
+```sh
+sudo grubby --update-kernel=/boot/vmlinuz-<release> --args="appledrm.force_vrr=1"
+```
+
+`kernel/install-vrr-kernel.sh` does not add that argument for you; it prints the
+GRUB step after installing. Verify with `modinfo appledrm | grep force_vrr`.
 
 Build and install alongside the stock Fedora kernel with
 `kernel/install-vrr-kernel.sh` (run as root). It installs modules, DTBs, the
 image, an initramfs, and a GRUB entry, leaving the default boot entry unchanged.
+It expects the built kernel tree at `$VRR_KERNEL_SRC` (default
+`$HOME/kernel-vrr/linux`).
 
 ## Mutter
 

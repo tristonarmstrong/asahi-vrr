@@ -1,9 +1,15 @@
 #!/bin/bash
 # Install the Asahi VRR test kernel (7.0.11+) ALONGSIDE the stock Fedora kernel.
-# Run as root:  sudo bash /home/tristonarmstrong/kernel-vrr/install-vrr-kernel.sh
+# Run as root from the built kernel source tree:
+#   sudo VRR_KERNEL_SRC=/path/to/linux bash install-vrr-kernel.sh
+# VRR_KERNEL_SRC defaults to $HOME/kernel-vrr/linux.
 set -euo pipefail
 
-SRC=/home/tristonarmstrong/kernel-vrr/linux
+SRC="${VRR_KERNEL_SRC:-$HOME/kernel-vrr/linux}"
+if [ ! -f "$SRC/include/config/kernel.release" ]; then
+  echo "no built kernel tree at $SRC (set VRR_KERNEL_SRC)" >&2
+  exit 1
+fi
 cd "$SRC"
 
 REL=$(cat include/config/kernel.release)

@@ -1,11 +1,13 @@
 #!/bin/bash
-# Build (if needed) and deploy the patched mutter libraries.
-# Revert with ./revert.sh. Run with sudo only for the install step.
+# Deploy the patched mutter libraries. Run with sudo.
+# Override the mutter work tree and backup dir if yours differ:
+#   sudo MUTTER_BASE=/path/to/mutter-50.5 MUTTER_BACKUP=/path/to/backup ./deploy.sh
+# MUTTER_BASE is the mutter source root; MUTTER_BACKUP holds the original libs.
 set -euo pipefail
 
-BASE=/home/tristonarmstrong/mutter-vrr
-SRC=$BASE/mutter-50.5/_build
-BK=/home/tristonarmstrong/mutter-backup
+BASE="${MUTTER_BASE:-$HOME/mutter-vrr/mutter-50.5}"
+SRC="$BASE/_build"
+BK="${MUTTER_BACKUP:-$HOME/mutter-backup}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "run with sudo" >&2
