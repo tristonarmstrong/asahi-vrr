@@ -1,0 +1,545 @@
+From de54e74116e46352918a5edbe5b0823cedf188d5 Mon Sep 17 00:00:00 2001
+From: Triston Armstrong <tarmstrong95@proton.me>
+Date: Thu, 24 Sep 2026 21:46:34 -0500
+Subject: [PATCH 1/3] drm: apple: apply VRR live in flush path instead of
+ forced modeset
+
+Forcing mode_changed when VRR_ENABLED toggles makes mutter's page-flip
+atomic commit fail with EINVAL, so VRR could never actually be enabled
+by userspace. Apply the adaptive-sync parameter live from the CRTC flush
+path instead, which is safe for page-flip commits.
+
+Also advertise vrr_capable from process_chunks/hotplug once modes are
+parsed, so mutter exposes +vrr modes.
+
+Includes temporary debug instrumentation (apple_ts_mode/ts_log based
+present-flip and swap logging) for VRR investigation.
+---
+ drivers/gpu/drm/apple/apple_drv.c      |   5 +
+ drivers/gpu/drm/apple/dcp-internal.h   |   2 +
+ drivers/gpu/drm/apple/dcp.c            |  58 +++++-
+ drivers/gpu/drm/apple/dcp.h            |   1 +
+ drivers/gpu/drm/apple/iomfb.c          |  11 ++
+ drivers/gpu/drm/apple/iomfb_template.c | 239 ++++++++++++++++++++++---
+ 6 files changed, 292 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 31b86e909..9bdbb2ba8 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -339,6 +339,11 @@ static int apple_probe_per_dcp(struct device *dev,
+ 	if (ret)
+ 		return ret;
+ 
++	if (dcp_has_vrr_mode(dcp)) {
++		drm_connector_set_vrr_capable_property(&connector->base, true);
++		dev_info(dev, "connector %d: advertising VRR capable\n", num);
++	}
++
+ 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
+ 	connector->connected = false;
+ 	connector->dcp = dcp;
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index 0a6859448..d4595c769 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -181,6 +181,8 @@ struct apple_dcp {
+ 	/* swap id of the last completed swap */
+ 	u32 last_swap_id;
+ 	ktime_t swap_start;
++	ktime_t ts_prev_flush;
++	ktime_t ts_prev_swapcb;
+ 
+ 	/* Current display mode */
+ 	bool during_modeset;
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 83ba20f7f..8cf42a6c4 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -62,6 +62,30 @@ bool force_vrr;
+ module_param(force_vrr, bool, 0644);
+ MODULE_PARM_DESC(force_vrr, "Always enable Adaptive Sync/ProMotion on supported displays");
+ 
++u64 apple_ts_freq = 24000000ULL;
++module_param(apple_ts_freq, ullong, 0644);
++MODULE_PARM_DESC(apple_ts_freq, "Timebase (Hz) used to encode DCP swap timestamps (default 24 MHz)");
++
++int apple_ts_mode;
++module_param(apple_ts_mode, int, 0644);
++MODULE_PARM_DESC(apple_ts_mode, "Swap timestamp model: 0=ts1=now,ts2=previous flush,ts3=now; 1=all now; 2=ts2=next expected present (now+period); 3=ts2=0; 4=ts2=now-apple_ts_pretend_rate period (fake past present); 5=ts2=now+apples_ts_pretend_rate period (fake future deadline)");
++
++u32 apple_ts_pretend_rate = 30;
++module_param(apple_ts_pretend_rate, uint, 0644);
++MODULE_PARM_DESC(apple_ts_pretend_rate, "Pretend swap rate (Hz) used by apple_ts_mode 4 and 5 to exercise VRR without a slow compositor");
++
++bool apple_ts_log;
++module_param(apple_ts_log, bool, 0644);
++MODULE_PARM_DESC(apple_ts_log, "Log every DCP swap submission timestamp values and pacing");
++
++u32 apple_vrr_media_rate;
++module_param(apple_vrr_media_rate, uint, 0644);
++MODULE_PARM_DESC(apple_vrr_media_rate, "mediaTargetRate (Q16.16) sent in the Adaptive Sync parameter; 0 lets the firmware derive it");
++
++u64 apple_min_freq = 402280000ULL;
++module_param(apple_min_freq, ullong, 0644);
++MODULE_PARM_DESC(apple_min_freq, "Value returned for the DCP 'minimum-frequency' provider property (pixel clock, must be >= videoClock)");
++
+ /* copied and simplified from drm_vblank.c */
+ static void send_vblank_event(struct drm_device *dev,
+ 		struct drm_pending_vblank_event *e,
+@@ -129,6 +153,14 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+ 		flip = now;
+ 	}
+ 	e->pipe = pipe;
++	if (READ_ONCE(apple_ts_mode) == 0) {
++		static ktime_t prev_flip;
++		s64 d = ktime_compare(prev_flip, KTIME_MIN) ?
++			ktime_us_delta(flip, prev_flip) : 0;
++		prev_flip = flip;
++		if (d > 0)
++			dev_info(dev->dev, "present flip: delta %lld us\n", d);
++	}
+ 	send_vblank_event(dev, e, seq, flip);
+ }
+ 
+@@ -365,9 +397,17 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
+ 		return -EINVAL;
+ 	}
+ 
+-	// if (dcp->vrr_enabled != crtc_state->vrr_enabled) {
+-	// 	crtc_state->mode_changed = true;
+-	// }
++	if (dcp->vrr_enabled != crtc_state->vrr_enabled) {
++		/*
++		 * Do NOT force mode_changed here: userspace (mutter) toggles
++		 * VRR_ENABLED via a page-flip atomic commit, and forcing a
++		 * modeset makes that commit fail with EINVAL. The adaptive
++		 * sync parameter is applied live from the flush path instead.
++		 */
++		dev_info(dcp->dev,
++			 "atomic_check: VRR requested %d -> %d (applied in flush)\n",
++			 dcp->vrr_enabled, crtc_state->vrr_enabled);
++	}
+ 
+ 	return 0;
+ }
+@@ -509,6 +549,18 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
+ 	dcp->connector = connector;
+ }
+ 
++bool dcp_has_vrr_mode(struct platform_device *pdev)
++{
++	struct apple_dcp *dcp = platform_get_drvdata(pdev);
++	int i;
++
++	for (i = 0; i < dcp->nr_modes; i++)
++		if (dcp->modes[i].vrr)
++			return true;
++
++	return false;
++}
++
+ 
+ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
+ {
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index bd2087684..af90c5cab 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -35,6 +35,7 @@ int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
+ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
+ int dcp_get_connector_type(struct platform_device *pdev);
+ bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
++bool dcp_has_vrr_mode(struct platform_device *pdev);
+ void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
+ 	      struct apple_connector *connector);
+ int dcp_start(struct platform_device *pdev);
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 1d90e4a25..df8b1d67a 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -246,6 +246,17 @@ void dcp_hotplug(struct work_struct *work)
+ 		drm_edid_free(connector->drm_edid);
+ 		drm_connector_set_vrr_capable_property(&connector->base, false);
+ 		connector->drm_edid = NULL;
++	} else {
++		int i;
++
++		for (i = 0; i < dcp->nr_modes; i++) {
++			if (dcp->modes[i].vrr) {
++				drm_connector_set_vrr_capable_property(
++					&connector->base, true);
++				dev_info(dcp->dev, "hotplug: advertising VRR capable\n");
++				break;
++			}
++		}
+ 	}
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index 0e5d5908a..36a485461 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -30,11 +30,18 @@
+ #include "parser.h"
+ #include "trace.h"
+ #include "version_utils.h"
++#include <linux/math64.h>
+ 
+ /* Register defines used in bandwidth setup structure */
+ #define REG_DOORBELL_BIT(idx) (2 + (idx))
+ 
+ extern bool force_vrr;
++extern u64 apple_ts_freq;
++extern int apple_ts_mode;
++extern bool apple_ts_log;
++extern u32 apple_vrr_media_rate;
++extern u32 apple_ts_pretend_rate;
++extern u64 apple_min_freq;
+ 
+ struct dcp_wait_cookie {
+ 	struct kref refcount;
+@@ -125,6 +132,28 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
+ 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+ 	dcp->last_swap_id = resp->swap_id;
+ 
++	if (apple_ts_log) {
++		u64 delta = ktime_compare(dcp->ts_prev_swapcb, KTIME_MIN) == 0 ?
++			0 : ktime_to_ns(ktime_sub(now, dcp->ts_prev_swapcb));
++		dev_info(dcp->dev, "swap complete: id %u delta %llu us\n",
++			 resp->swap_id, div_u64(delta, 1000));
++		dcp->ts_prev_swapcb = now;
++
++		if (apple_ts_mode == 0) {
++			const u32 *w = (const u32 *)resp->swap_info;
++			int i, n = sizeof(resp->swap_info) / sizeof(u32);
++			char buf[512];
++			int off = 0;
++			for (i = 0; i < n && off < (int)sizeof(buf) - 12; i++) {
++				if (w[i] != 0)
++					off += scnprintf(buf + off, sizeof(buf) - off,
++							 "%x:%08x ", i, w[i]);
++			}
++			buf[off] = 0;
++			dev_info(dcp->dev, "swap_info nz: %s\n", buf);
++		}
++	}
++
+ 	dcp_drm_crtc_page_flip(dcp, now);
+ 	if (dcp->crc_enabled) {
+ 		u32 crc32 = 0;
+@@ -224,6 +253,13 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
+ 	struct dcp_get_uint_prop_resp resp = (struct dcp_get_uint_prop_resp){
+ 	    .value = 0
+ 	};
++	char key[sizeof(req->key) + 1];
++	char obj[sizeof(req->obj) + 1];
++
++	memcpy(key, req->key, sizeof(req->key));
++	key[sizeof(req->key)] = 0;
++	memcpy(obj, req->obj, sizeof(req->obj));
++	obj[sizeof(req->obj)] = 0;
+ 
+ 	if (dcp->panel.has_mini_led &&
+ 	    memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
+@@ -237,12 +273,35 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
+ 	    }
+ 	}
+ 
++	/*
++	 * The DCP firmware asks the provider for the panel's minimum
++	 * frequency while computing the EDT/adaptive-sync frequency table.
++	 * Without it updateFrequencies() gives up and refresh stays fixed.
++	 */
++	if (strncmp(req->key, "minimum-frequency", sizeof(req->key)) == 0) {
++		resp.value = apple_min_freq;
++		resp.ret = true;
++	}
++
++	dev_info(dcp->dev, "get_uint_prop: obj '%s' key '%s' -> ret %u value %llu\n",
++		 obj, key, resp.ret, resp.value);
++
+ 	return resp;
+ }
+ 
+ static u8 iomfbep_cb_sr_set_property_int(struct apple_dcp *dcp,
+ 					 struct iomfb_sr_set_property_int_req *req)
+ {
++	char key[sizeof(req->key) + 1];
++	char obj[sizeof(req->obj) + 1];
++
++	memcpy(key, req->key, sizeof(req->key));
++	key[sizeof(req->key)] = 0;
++	memcpy(obj, req->obj, sizeof(req->obj));
++	obj[sizeof(req->obj)] = 0;
++	dev_info(dcp->dev, "sr_set_property_int: obj '%s' key '%s' value %llu null %u\n",
++		 obj, key, req->value, req->value_null);
++
+ 	if (memcmp(req->obj, "FMOI", sizeof(req->obj)) == 0) { /* "IOMF */
+ 		if (strncmp(req->key, "Brightness_Scale", sizeof(req->key)) == 0) {
+ 			if (!req->value_null)
+@@ -255,7 +314,15 @@ static u8 iomfbep_cb_sr_set_property_int(struct apple_dcp *dcp,
+ 
+ static void iomfbep_cb_set_fx_prop(struct apple_dcp *dcp, struct iomfb_set_fx_prop_req *req)
+ {
+-    // TODO: trace this, see if there properties which needs to used later
++	char key[sizeof(req->key) + 1];
++	char obj[sizeof(req->obj) + 1];
++
++	memcpy(key, req->key, sizeof(req->key));
++	key[sizeof(req->key)] = 0;
++	memcpy(obj, req->obj, sizeof(req->obj));
++	obj[sizeof(req->obj)] = 0;
++	dev_info(dcp->dev, "set_fx_prop: obj '%s' key '%s' value %u\n",
++		 obj, key, req->value);
+ }
+ 
+ /*
+@@ -491,6 +558,15 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
+ static struct dcp_read_edt_data_resp
+ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
+ {
++	char key[sizeof(req->key) + 1];
++
++	memcpy(key, req->key, sizeof(req->key));
++	key[sizeof(req->key)] = 0;
++	dev_info(dcp->dev,
++		 "read_edt_data: key '%s' count %u value %u %u %u %u\n",
++		 key, req->count, req->value[0], req->value[1],
++		 req->value[2], req->value[3]);
++
+ 	return (struct dcp_read_edt_data_resp){
+ 		.value[0] = req->value[0],
+ 		.ret = 0,
+@@ -592,14 +668,19 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
+ 		dcp_set_dimensions(dcp);
+ 	}
+ 
+-	// if (connector) {
+-	// 	for (i = 0; i < dcp->nr_modes; i++) {
+-	// 		if (dcp->modes[i].vrr) {
+-	// 			drm_connector_set_vrr_capable_property(&connector->base, true);
+-	// 			break;
+-	// 		}
+-	// 	}
+-	// }
++	if (dcp->connector) {
++		int i;
++
++		for (i = 0; i < dcp->nr_modes; i++) {
++			if (dcp->modes[i].vrr) {
++				drm_connector_set_vrr_capable_property(
++					&dcp->connector->base, true);
++				dev_info(dcp->dev,
++					 "process_chunks: advertising VRR capable\n");
++				break;
++			}
++		}
++	}
+ 
+ 	return true;
+ }
+@@ -1195,10 +1276,10 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 rate, void *cookie)
+ 	struct dcp_set_parameter_dcp param = {
+ 		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+ 		.value = {
+-			rate,              /* minRR */
+-			0,                 /* mediaTargetRate */
+-			0,                 /* Fractional Rate (?) */
+-			0,                 /* unused */
++			rate,                   /* minRR */
++			apple_vrr_media_rate,   /* mediaTargetRate */
++			0,                      /* Fractional Rate (?) */
++			0,                      /* unused */
+ 		},
+ #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+ 		.count = 3,
+@@ -1207,9 +1288,50 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 rate, void *cookie)
+ #endif
+ 	};
+ 
++	dev_info(dcp->dev, "adaptive_sync: sending minRR %u mediaTargetRate %u "
++		 "fractional 0\n", rate, apple_vrr_media_rate);
++
+ 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_adaptive_sync, cookie);
+ }
+ 
++/*
++ * Apply a live Adaptive Sync state change without a full modeset. Called
++ * from the CRTC flush path when userspace toggles VRR_ENABLED, which it
++ * does via a page-flip commit that must not be turned into a modeset.
++ */
++static void dcp_apply_vrr_flush(struct apple_dcp *dcp,
++				struct drm_crtc_state *crtc_state)
++{
++	struct dcp_display_mode *mode;
++	struct dcp_wait_cookie *cookie;
++	bool want_vrr = force_vrr || crtc_state->vrr_enabled;
++	int ret;
++
++	if (want_vrr == dcp->vrr_enabled)
++		return;
++
++	mode = lookup_mode(dcp, &crtc_state->mode);
++	if (!mode || !mode->vrr)
++		return;
++
++	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
++	if (!cookie)
++		return;
++
++	init_completion(&cookie->done);
++	kref_init(&cookie->refcount);
++	kref_get(&cookie->refcount);
++
++	dcp_set_adaptive_sync(dcp, want_vrr ? mode->min_vrr : 0, cookie);
++
++	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(2000));
++	kref_put(&cookie->refcount, release_wait_cookie);
++	if (ret == 0)
++		dev_warn(dcp->dev, "adaptive_sync flush update timed out\n");
++
++	dcp->vrr_enabled = want_vrr;
++}
++
+ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 			       struct drm_crtc_state *crtc_state)
+ {
+@@ -1252,6 +1374,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 	/* Use DCP swap timestamps on MacBook Pros with VRR */
+ 	dcp->use_timestamps = mode->vrr && dcp->main_display;
+ 
++	if (mode->vrr && dcp->connector)
++		drm_connector_set_vrr_capable_property(&dcp->connector->base,
++						       true);
++
+ 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+ 	if (!cookie) {
+ 		return -ENOMEM;
+@@ -1265,7 +1391,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 	dcp->during_modeset = true;
+ 
+ 	if (mode->vrr) {
+-		dcp_set_adaptive_sync(dcp, force_vrr ? mode->min_vrr : 0, cookie);
++		bool want_vrr = force_vrr || crtc_state->vrr_enabled;
++
++		dcp_set_adaptive_sync(dcp, want_vrr ? mode->min_vrr : 0, cookie);
+ 	} else {
+ 		dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+ 					 complete_set_digital_out_mode, cookie);
+@@ -1297,18 +1425,29 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 			jiffies_to_msecs(ret));
+ 	}
+ 	dcp->valid_mode = true;
+-	dcp->vrr_enabled = mode->vrr && force_vrr;
++	dcp->vrr_enabled = mode->vrr && (force_vrr || crtc_state->vrr_enabled);
+ 
+ 	return 0;
+ }
+ 
+ /*
+- * DCP timestamps are expressed in system timer ticks. Approximate
+- * this by converting from ktime nanoseconds to 24 MHz ticks.
++ * DCP timestamps are expressed in system timer ticks. By default we
++ * approximate this by converting from ktime nanoseconds to 24 MHz ticks,
++ * but the tick frequency can be overridden for experimentation.
+  */
++static u64 ns_to_tick(u64 ns, u64 freq)
++{
++	u64 s = ns / 1000000000ULL;
++	u64 rem = ns % 1000000000ULL;
++
++	if (!freq)
++		freq = 24000000ULL;
++	return s * freq + div_u64(rem * freq, 1000000000ULL);
++}
++
+ static u64 ns_to_mach(u64 ns)
+ {
+-	return ns * 3 / 125;
++	return ns_to_tick(ns, apple_ts_freq);
+ }
+ 
+ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_state *state)
+@@ -1322,6 +1461,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
+ 
+ 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+ 
++	dcp_apply_vrr_flush(dcp, crtc_state);
++
+ 	/* Reset all surfaces to defaults */
+ 	memset(req, 0, sizeof(*req));
+ 	for (l = 0; l < SWAP_SURFACES; l++)
+@@ -1431,10 +1572,66 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
+ 		 * are. They are something to do with presentation timing,
+ 		 * but that is all we know for sure. These values seem to
+ 		 * work well with VRR.
++		 *
++		 * The pacing reference must be the previous swap SUBMIT
++		 * time kept driver-side. dcp->swap_start is cleared by the
++		 * swap-complete path before the next flush runs, so using it
++		 * collapses ts1 == ts2 every frame and DCP sees no pacing.
+ 		 */
+-		req->swap.unk_pres_ts1 = ns_to_mach(ktime_get_ns());
+-		req->swap.unk_pres_ts2 = ns_to_mach(ktime_to_ns(dcp->swap_start));
+-		req->swap.unk_pres_ts3 = req->swap.unk_pres_ts1;
++		u64 now_ns = ktime_to_ns(ktime_get());
++		u64 prev_ns;
++		u64 t1, t2, t3;
++		u64 period_ns;
++
++		if (ktime_compare(dcp->ts_prev_flush, KTIME_MIN) == 0)
++			prev_ns = now_ns;
++		else
++			prev_ns = ktime_to_ns(dcp->ts_prev_flush);
++
++		period_ns = now_ns - prev_ns;
++		if (period_ns > 1000000000ULL)
++			period_ns = 0;
++
++		t1 = ns_to_mach(now_ns);
++		switch (apple_ts_mode) {
++		case 1: /* all identical */
++			t2 = t1;
++			break;
++		case 2: /* ts2 = scheduled next present */
++			t2 = ns_to_mach(now_ns + period_ns);
++			break;
++		case 3: /* ts2 disabled */
++			t2 = 0;
++			break;
++		case 4: /* fake past present at pretend rate */
++		{
++			u64 pt = div_u64(1000000000ULL,
++					   apple_ts_pretend_rate ? apple_ts_pretend_rate : 1);
++			t2 = ns_to_mach(now_ns - pt);
++			break;
++		}
++		case 5: /* fake future deadline at pretend rate */
++		{
++			u64 pt = div_u64(1000000000ULL,
++					   apple_ts_pretend_rate ? apple_ts_pretend_rate : 1);
++			t2 = ns_to_mach(now_ns + pt);
++			break;
++		}
++		default: /* ts2 = previous present (submit-paced) */
++			t2 = prev_ns ? ns_to_mach(prev_ns) : t1;
++			break;
++		}
++		t3 = t1;
++
++		if (apple_ts_log)
++			dev_info(dcp->dev, "swap ts: mode %d period %llu us t1 %llu t2 %llu t3 %llu\n",
++				 apple_ts_mode,
++				 div_u64(period_ns, 1000), t1, t2, t3);
++
++		dcp->ts_prev_flush = ktime_get();
++		req->swap.unk_pres_ts1 = t1;
++		req->swap.unk_pres_ts2 = t2;
++		req->swap.unk_pres_ts3 = t3;
+ 	}
+ 
+ 	/* These fields should be set together */
+-- 
+2.55.0
+

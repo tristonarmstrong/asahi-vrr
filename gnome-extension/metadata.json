@@ -1,0 +1,10 @@
+{
+  "name": "VRR Refresh Rate",
+  "description": "Shows the display's live refresh rate in the top bar. The value is measured from the GNOME Shell compositor's presented frames, so it updates in real time as VRR (variable refresh rate) raises and lowers the panel's rate. Includes a history sparkline and peak tracking.",
+  "uuid": "vrr-refreshrate@local",
+  "settings-schema": "org.gnome.shell.extensions.vrr-refreshrate",
+  "gettext-domain": "vrr-refreshrate",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version-name": "1.0",
+  "session-modes": ["user", "classic"]
+}

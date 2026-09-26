@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <enum id="org.gnome.shell.extensions.vrr-refreshrate.monitor-mode">
+    <value nick="primary" value="0"/>
+    <value nick="active" value="1"/>
+  </enum>
+  <enum id="org.gnome.shell.extensions.vrr-refreshrate.panel-position">
+    <value nick="left" value="0"/>
+    <value nick="center" value="1"/>
+    <value nick="right" value="2"/>
+  </enum>
+
+  <schema id="org.gnome.shell.extensions.vrr-refreshrate"
+          path="/org/gnome/shell/extensions/vrr-refreshrate/">
+    <key name="update-interval-ms" type="i">
+      <default>250</default>
+      <range min="100" max="2000"/>
+      <summary>UI update interval</summary>
+      <description>How often the top bar label is recalculated, in milliseconds.</description>
+    </key>
+    <key name="averaging-window-ms" type="i">
+      <default>800</default>
+      <range min="200" max="3000"/>
+      <summary>Averaging window</summary>
+      <description>Time window over which presented frames are counted to compute the refresh rate, in milliseconds.</description>
+    </key>
+    <key name="show-decimals" type="b">
+      <default>false</default>
+      <summary>Show decimals</summary>
+      <description>Show the refresh rate with two decimal places instead of rounding.</description>
+    </key>
+    <key name="show-idle-rate" type="b">
+      <default>true</default>
+      <summary>Show the rest rate when idle</summary>
+      <description>When the output is not being driven continuously, show the VRR floor (or the nominal rate if no floor is known) instead of a placeholder.</description>
+    </key>
+    <key name="monitor-mode" enum="org.gnome.shell.extensions.vrr-refreshrate.monitor-mode">
+      <default>'primary'</default>
+      <summary>Monitored display</summary>
+      <description>Which display to report: the primary display, or whichever display is currently updating most.</description>
+    </key>
+    <key name="panel-position" enum="org.gnome.shell.extensions.vrr-refreshrate.panel-position">
+      <default>'right'</default>
+      <summary>Panel position</summary>
+      <description>Where the indicator is placed in the top bar.</description>
+    </key>
+    <key name="debug" type="b">
+      <default>false</default>
+      <summary>Debug logging</summary>
+      <description>Log measured refresh rates and detected views to the journal. Useful when diagnosing what the extension sees.</description>
+    </key>
+  </schema>
+</schemalist>

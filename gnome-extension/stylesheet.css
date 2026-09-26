@@ -1,0 +1,21 @@
+.vrr-refresh-label {
+    font-feature-settings: "tnum";
+    font-variant-numeric: tabular-nums;
+    min-width: 4.2em;
+    text-align: right;
+}
+
+.vrr-refresh-label:insensitive,
+.vrr-refresh-label.idle {
+    opacity: 0.5;
+}
+
+.vrr-graph-box {
+    padding: 0;
+    margin: 0;
+}
+
+.vrr-sparkline {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+}
